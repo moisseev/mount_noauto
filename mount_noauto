@@ -1,0 +1,146 @@
+#!/bin/sh
+#
+# PROVIDE: mount_noauto
+# REQUIRE: LOGIN
+# KEYWORD: shutdown
+#
+# Simple FreeBSD rc script to mount file systems automatically at boot time.
+# It assumes that the mount points described in fstab file with "noauto" option.
+#
+# To prevent boot delays if a file system is not available at boot time
+# this script mounts file systems in background.
+#
+# For smbfs mount points password entries should be listed in /root/.nsmbrc file.
+# See mount_smbfs(8) for details.
+#
+#
+# Add the following lines to /etc/rc.conf to enable mount_noauto:
+#
+# mount_noauto_enable (bool):	Set it to "YES" to enable mount_noauto
+#				Default is "NO".
+# mount_noauto_list (list):	Space separated list of mount points to process.
+#				E.g. mount_noauto_list="/mnt/share1 /mnt/share2"
+#
+# Optional parameters:
+#
+# mount_noauto_attempts (num):	Number of mount attempts if file system is unavailable.
+#				Default is "10".
+# mount_noauto_delay (num):	Delay in seconds between mount attempts.
+#				Default is "180".
+#
+#
+# Copyright (c) 2015, Alexander Moisseev <moiseev@mezonplus.ru>
+# This software is released under the Simplified BSD License.
+#
+
+. /etc/rc.subr
+
+name=mount_noauto
+rcvar=${name}_enable
+
+load_rc_config $name
+
+[ -n "$mount_noauto_list" ] || {
+    warn "Define mount point list \$mount_noauto_list in /etc/rc.conf"
+    exit 1
+}
+
+: ${mount_noauto_enable:="NO"}
+: ${mount_noauto_attempts:=10}
+: ${mount_noauto_delay:=180}
+
+pidfile=${mount_noauto_pidfile:-"/var/run/${name}.pid"}
+
+command_interpreter=/bin/sh
+command=/usr/bin/true
+procname=/usr/local/etc/rc.d/$name
+
+start_postcmd="bg_mount &"
+status_precmd=status_precmd
+stop_precmd=stop_precmd
+stop_postcmd=stop_postcmd
+
+extra_commands=umount
+umount_cmd=${name}_umount
+
+list_mount_points() {
+	/sbin/mount | /usr/bin/grep " on $mount_point " | grep -v grep
+}
+
+status_precmd() {
+    echo
+    for mount_point in $mount_noauto_list; do
+	list_mount_points
+    done
+    echo
+    return 0
+}
+
+bg_mount() {
+    echo `pgrep -afn "${name} (one)?(re)?start$"` > $pidfile || exit 1
+
+    HOME=/root; export HOME
+
+    attempt=0
+    attempts=$mount_noauto_attempts
+    delay=$mount_noauto_delay
+
+    while : ; do
+	i=0
+	mount_failed=
+	failed_mount_points=
+	echo
+	for mount_point in $mount_noauto_list; do
+
+	    i=`expr $i + 1`
+
+	    eval [ \$mounted$i ] && continue
+
+	    status=`list_mount_points 2>&1` && {
+		warn "Already mounted: ${status}"
+		eval mounted$i=1
+		continue
+	    }
+
+	    if /sbin/mount $mount_point; then
+		eval mounted$i=1
+	    else
+		mount_failed=1
+		failed_mount_points="${failed_mount_points}$mount_point "
+	    fi
+	done
+
+	[ $mount_failed ] || break
+
+	attempt=`expr $attempt + 1`
+	msg="${failed_mount_points}mount attempt ($attempt/$attempts) failed."
+	[ $attempt -ge $attempts ] && {
+	    warn "$msg Giving up."
+	    break
+	}
+	warn "$msg Next attempt in $delay seconds."
+	sleep $delay
+    done
+
+    rm -f $pidfile
+}
+
+stop_precmd() {
+    bg_mount_pid=`pgrep -F $pidfile` || return
+    # get bg_mount's PGID
+    pgid=`ps -o pgid= $bg_mount_pid`
+}
+
+stop_postcmd() {
+    # kill bg_mount's childs
+    kill -- -$pgid
+    rm -f $pidfile
+}
+
+mount_noauto_umount() {
+    for mount_point in $mount_noauto_list; do
+	status=`/sbin/umount $mount_point 2>&1` || warn "${status}!"
+    done
+}
+
+run_rc_command "$1"
